@@ -1,247 +1,329 @@
-const { connect } = require('puppeteer-real-browser');
-const { PuppeteerScreenRecorder } = require('puppeteer-screen-recorder');
+'use strict';
+
+const {
+    connect
+} = require('puppeteer-real-browser');
 const fs = require('fs');
-const path = require('path');
 
-const FAKE_PAGE = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Turnstile</title>
-</head>
-<body>
-  <div class="turnstile"></div>
-  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" defer></script>
-  <script>
-    window.onloadTurnstileCallback = function () {
-      turnstile.render('.turnstile', {
-        sitekey: '<site-key>',
-        callback: function (token) {
-          var c = document.createElement('input');
-          c.type = 'hidden';
-          c.name = 'cf-response';
-          c.value = token;
-          document.body.appendChild(c);
-        },
-      });
+const WIDTH = 1280;
+const HEIGHT = 800;
+
+const ChallengePlatform = {
+    JAVASCRIPT: 'non-interactive',
+    MANAGED: 'managed',
+    INTERACTIVE: 'interactive',
+};
+
+const FALLBACK_UA =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function loadLines(fp) {
+    try {
+        return fs.readFileSync(fp, 'utf8').split('\n').map(l => l.trim()).filter(Boolean);
+    } catch {
+        return [];
+    }
+}
+
+function randomChoice(arr) {
+    return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function getChromeUA() {
+    const agents = loadLines('data/useragents.txt');
+    return agents.length ? randomChoice(agents) : FALLBACK_UA;
+}
+
+function parseProxy(url) {
+    const u = new URL(url);
+    return {
+        serverUrl: `${u.protocol}//${u.hostname}${u.port ? ':' + u.port : ''}`,
+        username: u.username || null,
+        password: u.password || null,
     };
-  </script>
-</body>
-</html>`;
-
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-class TurnstileSolver {
-  constructor(opts = {}) {
-    this.timeout   = opts.timeout   ?? 60000;
-    this.record    = opts.record    ?? false;
-    this.recordDir = opts.recordDir ?? path.join('/tmp', 'recordings');
-    this.proxy     = opts.proxy     ?? null;
-    this.width     = opts.width     ?? 1280;
-    this.height    = opts.height    ?? 720;
+function extractClearance(cookies) {
+    return cookies.find(c => c.name === 'cf_clearance') || null;
+}
 
-    this.browser   = null;
-    this.isReady   = false;
-  }
+function buildCookieString(cookies) {
+    return cookies.map(c => `${c.name}=${c.value}`).join('; ');
+}
 
-  async initialize() {
-    if (this.isReady) return;
-
-    const { browser } = await connect({
-      headless: true,
-      turnstile: true,
-      connectOption: {
-        defaultViewport: { width: this.width, height: this.height },
-        timeout: 120000,
-        protocolTimeout: 300000,
-        args: [
-          `--window-size=${this.width},${this.height}`,
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--disable-web-security',
-        ],
-      },
-      disableXvfb: false,
-    });
-
-    this.browser = browser;
-    this.isReady = true;
-  }
-
-  async cleanup() {
-    if (this.browser) {
-      try { await this.browser.close(); } catch {}
-      this.browser = null;
-      this.isReady = false;
+async function detectChallenge(page) {
+    try {
+        const html = await page.content();
+        for (const val of Object.values(ChallengePlatform)) {
+            if (html.includes(`cType: '${val}'`)) return val;
+        }
+        return null;
+    } catch {
+        return null;
     }
-  }
+}
 
-  async _newPage() {
-    const page = await this.browser.newPage();
-
-    await page.setDefaultTimeout(30000);
-    await page.setDefaultNavigationTimeout(30000);
-
-    if (this.proxy?.username && this.proxy?.password) {
-      await page.authenticate({
-        username: this.proxy.username,
-        password: this.proxy.password,
-      });
-    }
-
-    return page;
-  }
-
-  async solveWithSitekey(url, siteKey) {
-    if (!this.isReady) await this.initialize();
-
-    const t0   = Date.now();
-    const page = await this._newPage();
+async function findCFFrame(page) {
+    try {
+        const frame = page.frames().find(f => {
+            try {
+                return f.url().includes('challenges.cloudflare.com');
+            } catch {
+                return false;
+            }
+        });
+        if (frame) return frame;
+    } catch {
+        /* ignore */ }
 
     try {
-      const fakeHtml = FAKE_PAGE.replace(/<site-key>/g, siteKey);
-      const baseUrl  = url.endsWith('/') ? url : url + '/';
+        const el = await page.$('iframe[src*="challenges.cloudflare.com"]');
+        if (el) return await el.contentFrame();
+    } catch {
+        /* ignore */ }
 
-      await page.setRequestInterception(true);
-      page.on('request', async (req) => {
-        if ([url, baseUrl].includes(req.url()) && req.resourceType() === 'document') {
-          await req.respond({ status: 200, contentType: 'text/html', body: fakeHtml });
+    return null;
+}
+
+async function clickCFFrame(page, frame) {
+    await sleep(1500);
+
+    try {
+        const cb = await frame.$('input[type="checkbox"]').catch(() => null);
+        if (cb) {
+            const box = await cb.boundingBox().catch(() => null);
+            if (box) {
+                await cb.click();
+                return 'checkbox';
+            }
+        }
+
+        const label = await frame.$('label').catch(() => null);
+        if (label) {
+            const box = await label.boundingBox().catch(() => null);
+            if (box) {
+                await label.click();
+                return 'label';
+            }
+        }
+
+        const widget = await frame.$('.cf-turnstile-content, #cf-stage, .ctp-checkbox-label').catch(() => null);
+        if (widget) {
+            const box = await widget.boundingBox().catch(() => null);
+            if (box) {
+                await widget.click();
+                return 'widget';
+            }
+        }
+
+        const body = await frame.$('body').catch(() => null);
+        if (body) {
+            const box = await body.boundingBox().catch(() => null);
+            if (box && box.width > 0) {
+                await body.click();
+                return 'body';
+            }
+        }
+    } catch (e) {}
+
+    return null;
+}
+
+async function solveChallenge(page, timeoutSecs = 30) {
+    const deadline = Date.now() + timeoutSecs * 1000;
+    let attempt = 0;
+    let lastClicked = 0;
+
+    while (Date.now() < deadline) {
+        attempt++;
+
+        const cookies = await page.cookies().catch(() => []);
+        if (extractClearance(cookies)) {
+            return;
+        }
+
+        const platform = await detectChallenge(page);
+        if (!platform) {
+            return;
+        }
+
+        const frame = await findCFFrame(page);
+        if (!frame) {
+            await sleep(500);
+            continue;
+        }
+
+        if (Date.now() - lastClicked < 5000) {
+            await sleep(500);
+            continue;
+        }
+
+        const result = await clickCFFrame(page, frame);
+        if (result) {
+            lastClicked = Date.now();
+            await sleep(2500);
         } else {
-          await req.continue().catch(() => {});
+            await sleep(500);
         }
-      });
-
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForSelector('[name="cf-response"]', { timeout: this.timeout });
-
-      const token = await page.evaluate(() =>
-        document.querySelector('[name="cf-response"]')?.value ?? null
-      );
-
-      await page.close();
-
-      if (!token || token.length < 10) throw new Error('Token invalid or empty');
-
-      return {
-        success: true,
-        creator: 'XAi Community',
-        token,
-        time: +((Date.now() - t0) / 1000).toFixed(3),
-      };
-    } catch (err) {
-      try { await page.close(); } catch {}
-      return {
-        success: false,
-        error: err.message,
-        time: +((Date.now() - t0) / 1000).toFixed(3),
-      };
     }
-  }
-
-  async solveFromPage(url) {
-    if (!this.isReady) await this.initialize();
-
-    const t0   = Date.now();
-    const page = await this._newPage();
-
-    try {
-      await page.evaluateOnNewDocument(() => {
-        async function waitForToken() {
-          let token = null;
-          while (!token) {
-            try { token = window.turnstile?.getResponse(); } catch {}
-            await new Promise((r) => setTimeout(r, 500));
-          }
-          const c   = document.createElement('input');
-          c.type    = 'hidden';
-          c.name    = 'cf-response';
-          c.value   = token;
-          document.body.appendChild(c);
-        }
-        waitForToken();
-      });
-
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForSelector('[name="cf-response"]', { timeout: this.timeout });
-
-      const token = await page.evaluate(() =>
-        document.querySelector('[name="cf-response"]')?.value ?? null
-      );
-
-      await page.close();
-
-      if (!token || token.length < 10) throw new Error('Token invalid or empty');
-
-      return {
-        success: true,
-        creator: 'XAi Community',
-        token,
-        time: +((Date.now() - t0) / 1000).toFixed(3),
-      };
-    } catch (err) {
-      try { await page.close(); } catch {}
-      return {
-        success: false,
-        error: err.message,
-        time: +((Date.now() - t0) / 1000).toFixed(3),
-      };
-    }
-  }
-
-  async solve(url, siteKey = null) {
-    return siteKey
-      ? this.solveWithSitekey(url, siteKey)
-      : this.solveFromPage(url);
-  }
 }
 
-// Handler para Vercel
-let solverInstance = null;
+async function solveCloudflare({
+    url,
+    headless = true,
+    proxy = null,
+    proxyFile = null,
+    timeout = 30,
+} = {}) {
+    const proxies = proxyFile ? loadLines(proxyFile) : [];
+    const chosenProxy = proxy || (proxies.length ? randomChoice(proxies) : null);
+    const userAgent = getChromeUA();
+    const parsed = chosenProxy ? parseProxy(chosenProxy) : null;
 
+    const args = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-quic',
+        `--window-size=${WIDTH},${HEIGHT}`,
+    ];
+    if (parsed) args.push(`--proxy-server=${parsed.serverUrl}`);
+
+    const {
+        browser,
+        page
+    } = await connect({
+        headless,
+        args,
+        turnstile: false,
+        connectOption: {},
+        disableXvfb: true,
+        ignoreAllFlags: false,
+    });
+
+    try {
+        await page.setViewport({
+            width: WIDTH,
+            height: HEIGHT
+        });
+        await page.setUserAgent(userAgent);
+
+        if (parsed?.username) {
+            await page.authenticate({
+                username: parsed.username,
+                password: parsed.password
+            });
+        }
+
+        try {
+            await page.goto(url, {
+                waitUntil: 'domcontentloaded',
+                timeout: timeout * 1000
+            });
+        } catch (e) {
+            await browser.close();
+            return {
+                url,
+                success: false,
+                error: `Navigation error: ${e.message}`
+            };
+        }
+
+        await sleep(2000);
+
+        let cookies = await page.cookies().catch(() => []);
+        let clearance = extractClearance(cookies);
+
+        if (!clearance) {
+            const platform = await detectChallenge(page);
+
+            if (!platform) {
+                await browser.close();
+                return {
+                    url,
+                    success: false,
+                    error: 'No Cloudflare challenge detected'
+                };
+            }
+
+            await solveChallenge(page, timeout);
+
+            cookies = await page.cookies().catch(() => []);
+            clearance = extractClearance(cookies);
+        }
+
+        const finalUA = await page.evaluate(() => navigator.userAgent).catch(() => userAgent);
+
+        await browser.close();
+
+        if (!clearance) {
+            return {
+                url,
+                success: false,
+                error: 'Failed to obtain cf_clearance cookie'
+            };
+        }
+
+        const cookieString = buildCookieString(cookies);
+        const unixTimestamp = Math.floor(clearance.expires - 365 * 24 * 3600);
+        const timestamp = new Date(unixTimestamp * 1000).toISOString();
+
+        return {
+            success: true,
+            url,
+            proxy: chosenProxy,
+            user_agent: finalUA,
+            cf_clearance: clearance.value,
+            all_cookies: cookies,
+            cookie_string: cookieString,
+            unix_timestamp: unixTimestamp,
+            timestamp,
+            domain: clearance.domain,
+        };
+
+    } catch (err) {
+        await browser.close().catch(() => {});
+        throw err;
+    }
+}
+
+// Handler para Koyeb
 module.exports = async (req, res) => {
-  // Configurar CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    // Configurar CORS
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
-
-  const { url, siteKey, timeout, width, height } = req.body;
-
-  if (!url) {
-    return res.status(400).json({ error: 'URL is required' });
-  }
-
-  try {
-    // Crear o reutilizar instancia del solver
-    if (!solverInstance) {
-      solverInstance = new TurnstileSolver({
-        timeout: timeout || 60000,
-        record: false,
-        width: width || 1280,
-        height: height || 720
-      });
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
     }
 
-    const result = await solverInstance.solve(url, siteKey || null);
-    
-    return res.status(200).json(result);
-  } catch (error) {
-    console.error('Error solving Turnstile:', error);
-    return res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
+    if (req.method !== 'POST') {
+        return res.status(405).json({ error: 'Method not allowed' });
+    }
+
+    const { url, proxy, timeout = 30, headless = true } = req.body;
+
+    if (!url) {
+        return res.status(400).json({ error: 'URL is required' });
+    }
+
+    try {
+        const result = await solveCloudflare({
+            url,
+            headless: true,
+            proxy: proxy || null,
+            timeout: timeout
+        });
+        
+        return res.status(200).json(result);
+    } catch (error) {
+        console.error('Error solving Cloudflare:', error);
+        return res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
 };
