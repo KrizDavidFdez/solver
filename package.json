@@ -1,0 +1,17 @@
+{
+  "name": "turnstile-solver-api",
+  "version": "1.0.0",
+  "description": "Cloudflare Turnstile Solver API for Vercel",
+  "main": "api/solve.js",
+  "scripts": {
+    "start": "node api/solve.js"
+  },
+  "dependencies": {
+    "puppeteer-real-browser": "^1.0.0",
+    "puppeteer-screen-recorder": "^2.1.0",
+    "puppeteer-core": "^21.0.0"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}
