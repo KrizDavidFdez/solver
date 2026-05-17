@@ -8,10 +8,10 @@
   },
   "dependencies": {
     "puppeteer-real-browser": "^1.0.0",
-    "puppeteer-screen-recorder": "^2.1.0",
     "puppeteer-core": "^21.0.0"
   },
+  "devDependencies": {},
   "engines": {
-    "node": ">=18.x"
+    "node": "18.x"
   }
 }
